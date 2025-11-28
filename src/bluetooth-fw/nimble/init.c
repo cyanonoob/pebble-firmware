@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2025 Google LLC */
+/* SPDX-FileCopyrightText: 2025 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include <FreeRTOS.h>
@@ -70,7 +71,7 @@ void bt_driver_init(void) {
   TaskParameters_t host_task_params = {
       .pvTaskCode = prv_host_task_main,
       .pcName = "NimbleHost",
-      .usStackDepth = 4000 / sizeof(StackType_t),  // TODO: probably reduce this
+      .usStackDepth = 5000 / sizeof(StackType_t),
       .uxPriority = (configMAX_PRIORITIES - 2) | portPRIVILEGE_BIT,
       .puxStackBuffer = NULL,
   };
