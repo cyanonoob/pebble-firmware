@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2024 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #define FILE_LOG_COLOR LOG_COLOR_BLUE
@@ -22,6 +23,7 @@ static void prv_pairability_timer_cb(void *unused);
 
 static int s_allow_bt_pairing_refcount = 0;
 static int s_allow_ble_pairing_refcount = 0;
+static bool s_last_ble_discoverable_state = false;
 
 static RegularTimerInfo s_pairability_timer_info = {
   .cb = prv_pairability_timer_cb,
@@ -40,13 +42,14 @@ static void evaluate_pairing_refcount(void *data) {
   bool is_ble_pairable_and_discoverable = (s_allow_ble_pairing_refcount > 0);
 
   bt_driver_le_pairability_set_enabled(is_ble_pairable_and_discoverable);
-  if (gap_le_slave_is_discoverable() != is_ble_pairable_and_discoverable) {
+  if (s_last_ble_discoverable_state != is_ble_pairable_and_discoverable) {
     if (is_ble_pairable_and_discoverable) {
       bt_local_addr_pause_cycling();
     } else {
       bt_local_addr_resume_cycling();
     }
     gap_le_slave_set_discoverable(is_ble_pairable_and_discoverable);
+    s_last_ble_discoverable_state = is_ble_pairable_and_discoverable;
   }
 
   if (bt_driver_supports_bt_classic()) {
