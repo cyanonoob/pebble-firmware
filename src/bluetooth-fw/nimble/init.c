@@ -97,6 +97,11 @@ bool bt_driver_start(BTDriverConfig *config) {
   int rc;
   BaseType_t f_rc;
 
+  if (ble_hs_is_enabled()) {
+    PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_WARNING, "NimBLE host already enabled; skipping start");
+    return true;
+  }
+
   s_dis_info = config->dis_info;
   ble_svc_dis_model_number_set(s_dis_info.model_number);
   ble_svc_dis_serial_number_set(s_dis_info.serial_number);
@@ -109,21 +114,41 @@ bool bt_driver_start(BTDriverConfig *config) {
   ble_svc_dis_init();
   pebble_pairing_service_init();
   ble_svc_bas_init();
-  
+
   ble_hs_sched_start();
   f_rc = xSemaphoreTake(s_host_started, milliseconds_to_ticks(s_bt_stack_start_stop_timeout_ms));
   if (f_rc != pdTRUE) {
     PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_ERROR, "Host synchronization timed out");
-    return false;
+    goto err;
   }
 
   rc = ble_hs_util_ensure_addr(0);
   if (rc != 0) {
     PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_ERROR, "Failed to ensure address: 0x%04x", (uint16_t)rc);
-    return false;
+    goto err;
   }
 
   return true;
+
+err:
+  rc = ble_hs_stop(&s_listener, prv_ble_hs_stop_cb, NULL);
+  if (rc == BLE_HS_EALREADY) {
+    return false;
+  } else if (rc != 0) {
+    PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_ERROR,
+              "Failed to stop NimBLE host after start failure: 0x%04x", (uint16_t)rc);
+    return false;
+  }
+
+  f_rc = xSemaphoreTake(s_host_stopped, milliseconds_to_ticks(s_bt_stack_start_stop_timeout_ms));
+  if (f_rc != pdTRUE) {
+    PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_ERROR, "NimBLE host stop timed out after start failure");
+    return false;
+  }
+
+  (void)ble_gatts_reset();
+
+  return false;
 }
 
 void bt_driver_stop(void) {
