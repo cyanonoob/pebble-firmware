@@ -145,11 +145,17 @@ static uint8_t s_timer_ticks;
 
 static uint8_t s_disconnect_counter;
 
+//! Caps rediscovery on stale meta handles to once per BLE connection.
+static bool s_rediscovery_requested_this_connection;
+
 // -------------------------------------------------------------------------------------------------
 // Function Prototypes
 
 static void prv_send_next_packets(PPoGATTClient *client);
 static void prv_start_reset(PPoGATTClient *client);
+static void prv_request_meta_rediscovery(PPoGATTClient *client);
+
+extern BTErrno gatt_client_discovery_rediscover_all(const BTDeviceInternal *device);
 
 //! Gets the GAPLEConnection associated with the characteristic reference.
 //! @return The connection or NULL in case it could not be found.
@@ -719,6 +725,32 @@ static void prv_handle_data_notification(PPoGATTClient *client,
 
 // -------------------------------------------------------------------------------------------------
 
+static void prv_rediscover_kernelbg_cb(void *data) {
+  BTDeviceInternal *device = (BTDeviceInternal *)data;
+  const BTErrno e = gatt_client_discovery_rediscover_all(device);
+  kernel_free(device);
+  if (e != BTErrnoOK) {
+    PBL_LOG(LOG_LEVEL_ERROR, "PPoGATT couldn't restart discovery: %d", (int)e);
+  }
+}
+
+static void prv_request_meta_rediscovery(PPoGATTClient *client) {
+  bt_lock_assert_held(true);
+
+  GAPLEConnection *connection =
+      gatt_client_characteristic_get_connection(client->characteristics.meta);
+  if (!connection) {
+    return;
+  }
+
+  BTDeviceInternal *device = kernel_malloc(sizeof(BTDeviceInternal));
+  if (!device) {
+    return;
+  }
+  *device = connection->device;
+  system_task_add_callback(prv_rediscover_kernelbg_cb, device);
+}
+
 static void prv_retry_meta_read(PPoGATTClient *client) {
   bt_lock_assert_held(true);
 
@@ -860,7 +892,13 @@ handle_retriable_error:
   }
   PBL_LOG(LOG_LEVEL_ERROR, "PPoGATT meta read failed after %u retries",
           PPOGATT_META_READ_RETRY_COUNT_MAX);
-  // Fall through to handle_error
+
+  // Cached handle may be stale; try once with fresh discovery.
+  if (!s_rediscovery_requested_this_connection) {
+    PBL_LOG(LOG_LEVEL_INFO, "Triggering GATT rediscovery for fresh PPoGATT handles");
+    s_rediscovery_requested_this_connection = true;
+    prv_request_meta_rediscovery(client);
+  }
 
 handle_error:
   PBL_LOG(LOG_LEVEL_ERROR, "Failed handling PPoGATT meta: len=%u ver=%x err=%x",
@@ -877,6 +915,7 @@ void ppogatt_create(void) {
     PBL_ASSERT_TASK(PebbleTask_KernelMain);
     PBL_ASSERTN(!s_ppogatt_head);
     s_timer_ticks = 0;
+    s_rediscovery_requested_this_connection = false;
   }
   bt_unlock();
 }
@@ -1379,6 +1418,7 @@ void ppogatt_destroy(void) {
       prv_delete_client(client, true /* is_disconnected */, DeleteReason_DestroyCalled);
       client = next;
     }
+    s_rediscovery_requested_this_connection = false;
   }
   bt_unlock();
 
