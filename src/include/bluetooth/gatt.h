@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2024 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #pragma once
@@ -100,7 +101,8 @@ void bt_driver_gatt_acknowledge_indication(uint32_t connection_id, uint32_t tran
 // TODO: This will probably need to be changed for the Dialog chip (doesn't have transaction ids)
 void bt_driver_gatt_respond_read_subscription(uint32_t transaction_id, uint16_t response_code);
 
-void bt_driver_gatt_send_changed_indication(uint32_t connection_id, const ATTHandleRange *data);
+void bt_driver_gatt_send_changed_indication(const BTDeviceInternal *device,
+                                            const ATTHandleRange *data);
 
 
 BTErrno bt_driver_gatt_write_without_response(GAPLEConnection *connection,
