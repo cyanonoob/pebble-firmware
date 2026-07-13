@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2024 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "gap_le_connect.h"
@@ -860,10 +861,12 @@ static BTErrno prv_register_intent(struct RegisterIntentRequest *request,
   if (request->is_bonding_based) {
     const GAPLEConnection *connection = gap_le_connection_find_by_irk(&request->bonding.irk);
     if (!connection) {
-      if (sm_is_pairing_info_irk_not_used(&request->bonding.irk)) {
-        PBL_LOG(LOG_LEVEL_DEBUG, "register_intent: IRK not used, searching by addr");
-        connection = gap_le_connection_by_device(&request->bonding.device);
-      }
+      // The connection may not have an IRK yet: right after pairing, the
+      // bonding change handlers (which get here) can run before the driver
+      // delivers the IRK update. The connection address has already been
+      // updated to the identity address by then, so match by address too.
+      PBL_LOG(LOG_LEVEL_DEBUG, "register_intent: no IRK match, searching by addr");
+      connection = gap_le_connection_by_device(&request->bonding.device);
     }
     if (connection) {
       is_already_connected = true;
