@@ -13,6 +13,7 @@
 
 #include <bluetooth/gatt.h>
 
+#include "kernel/event_loop.h"
 #include "kernel/pbl_malloc.h"
 #include "services/common/analytics/analytics.h"
 #include "services/common/comm_session/session_transport.h"
@@ -346,7 +347,7 @@ static void prv_check_timeouts(PPoGATTClient *client) {
   }
 }
 
-static void prv_timer_callback(void *unused) {
+static void prv_ack_timeout_kernelmain_cb(void *unused) {
   bt_lock();
   {
     PPoGATTClient *client = s_ppogatt_head;
@@ -357,6 +358,12 @@ static void prv_timer_callback(void *unused) {
     }
   }
   bt_unlock();
+}
+
+//! Never block on bt_lock from the timer task (it stalls every other timer in
+//! the system); bounce to KernelMain, where the rest of the PPoG state machine runs.
+static void prv_timer_callback(void *unused) {
+  launcher_task_add_callback(prv_ack_timeout_kernelmain_cb, NULL);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -783,11 +790,22 @@ static void prv_retry_meta_read(PPoGATTClient *client) {
   }
 }
 
-static void prv_meta_read_retry_timer_cb(void *data) {
+static void prv_meta_read_retry_kernelmain_cb(void *data) {
   PPoGATTClient *client = (PPoGATTClient *)data;
   bt_lock();
-  prv_retry_meta_read(client);
+  {
+    // make sure we didn't disconnect in between
+    if (prv_is_client_valid(client)) {
+      prv_retry_meta_read(client);
+    }
+  }
   bt_unlock();
+}
+
+//! Never block on bt_lock from the timer task; bounce to KernelMain
+//! (prv_retry_meta_read also calls into NimBLE, which doesn't belong on the timer task).
+static void prv_meta_read_retry_timer_cb(void *data) {
+  launcher_task_add_callback(prv_meta_read_retry_kernelmain_cb, data);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -1149,7 +1167,7 @@ static const PPoGATTPacket * prv_prepare_next_reset_packet(const PPoGATTClient *
 
 // -------------------------------------------------------------------------------------------------
 
-void rx_ack_timer_cb(void *data) {
+static void prv_rx_ack_kernelmain_cb(void *data) {
   PPoGATTClient *client = (PPoGATTClient *)data;
   bt_lock();
   {
@@ -1160,6 +1178,11 @@ void rx_ack_timer_cb(void *data) {
     }
   }
   bt_unlock();
+}
+
+//! Never block on bt_lock from the timer task; bounce to KernelMain.
+static void rx_ack_timer_cb(void *data) {
+  launcher_task_add_callback(prv_rx_ack_kernelmain_cb, data);
 }
 
 static const PPoGATTPacket * prv_prepare_next_packet(PPoGATTClient *client,
@@ -1467,7 +1490,7 @@ uint32_t ppogatt_client_count(void) {
 void ppogatt_trigger_rx_ack_send_timeout(void) {
   PPoGATTClient *client = s_ppogatt_head;
   while (client) {
-    rx_ack_timer_cb(client);
+    prv_rx_ack_kernelmain_cb(client);
     client = (PPoGATTClient *) client->node.next;
   }
 }
