@@ -707,7 +707,7 @@ static void prv_handle_data_notification(PPoGATTClient *client,
     PBL_LOG(LOG_LEVEL_ERROR, "Invalid type %u", packet->type);
     return;
   }
-  if (UNLIKELY(packet->type) == PPoGATTPacketTypeResetRequest) {
+  if (UNLIKELY(packet->type == PPoGATTPacketTypeResetRequest)) {
     PBL_LOG(LOG_LEVEL_INFO, "Got reset request!");
     prv_handle_reset_request(client);
     return;
