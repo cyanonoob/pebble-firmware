@@ -1,5 +1,6 @@
 /* SPDX-FileCopyrightText: 2025 Google LLC */
 /* SPDX-FileCopyrightText: 2026 Geert van Dijk */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include <stdio.h>
@@ -21,6 +22,7 @@
 static const ble_uuid16_t s_device_name_chr_uuid = BLE_UUID16_INIT(0x2A00);
 static char s_device_name[BT_DEVICE_NAME_BUFFER_SIZE];
 static bool s_pairing_in_progress;
+static uint16_t s_pairing_conn_handle;
 
 static int prv_device_name_read_event_cb(uint16_t conn_handle, const struct ble_gatt_error *error,
                                          struct ble_gatt_attr *attr, void *arg) {
@@ -112,7 +114,21 @@ static void prv_handle_connection_event(struct ble_gap_event *event) {
   bt_driver_handle_le_connection_complete_event(&complete_event);
 }
 
+static void prv_end_pairing(uint16_t conn_handle, bool success) {
+  if (!s_pairing_in_progress || conn_handle != s_pairing_conn_handle) {
+    return;
+  }
+
+  PairingUserConfirmationCtx *ctx = (PairingUserConfirmationCtx *)((uintptr_t)conn_handle);
+  bt_driver_cb_pairing_confirm_handle_completed(ctx, success);
+  nimble_pairing_handle_completed();
+  s_pairing_in_progress = false;
+}
+
 static void prv_handle_disconnection_event(struct ble_gap_event *event) {
+  // A link dropped mid-pairing raises no pairing complete event.
+  prv_end_pairing(event->disconnect.conn.conn_handle, false);
+
   GattDeviceDisconnectionEvent gatt_event;
   nimble_addr_to_pebble_addr(&event->disconnect.conn.peer_id_addr, &gatt_event.dev_address);
   bt_driver_cb_gatt_handle_disconnect(&gatt_event);
@@ -202,17 +218,11 @@ static void prv_handle_passkey_event(struct ble_gap_event *event) {
   snprintf(passkey_str, sizeof(passkey_str), "%06lu", passkey);
   bt_driver_cb_pairing_confirm_handle_request(ctx, device_name, passkey_str);
   s_pairing_in_progress = true;
+  s_pairing_conn_handle = event->passkey.conn_handle;
 }
 
 static void prv_handle_pairing_complete_event(struct ble_gap_event *event) {
-  if (!s_pairing_in_progress) {
-    return;
-  }
-
-  PairingUserConfirmationCtx *ctx =
-      (PairingUserConfirmationCtx *)((uintptr_t)event->pairing_complete.conn_handle);
-  bt_driver_cb_pairing_confirm_handle_completed(ctx, event->pairing_complete.status == 0);
-  s_pairing_in_progress = false;
+  prv_end_pairing(event->pairing_complete.conn_handle, event->pairing_complete.status == 0);
 }
 
 static void prv_handle_identity_resolved_event(struct ble_gap_event *event) {

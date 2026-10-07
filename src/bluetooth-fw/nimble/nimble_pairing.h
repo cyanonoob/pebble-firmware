@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2026 Geert van Dijk */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #pragma once
@@ -16,3 +17,8 @@
 //! away, and the user types it on the phone.
 uint32_t nimble_pairing_handle_passkey_action(uint16_t conn_handle,
                                               const struct ble_gap_passkey_params *params);
+
+//! Forgets the pairing that was waiting for the user, once it has ended (completed, failed, or
+//! its link dropped). A late answer from the user is then ignored instead of being applied to
+//! whatever runs on that connection handle next.
+void nimble_pairing_handle_completed(void);

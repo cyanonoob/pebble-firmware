@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2026 Geert van Dijk */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 // Pairing user interaction for the NimBLE driver: numeric comparison (LE Secure Connections) and
@@ -67,6 +68,7 @@ void test_nimble_pairing__initialize(void) {
   s_rng_value = 0;
   memset(&s_injected, 0, sizeof(s_injected));
   memset(&s_terminated, 0, sizeof(s_terminated));
+  nimble_pairing_handle_completed();
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -144,4 +146,41 @@ void test_nimble_pairing__numcmp_after_passkey_pairing_uses_numcmp(void) {
   cl_assert_equal_i(s_injected.count, 2);
   cl_assert_equal_i(s_injected.io.action, BLE_SM_IOACT_NUMCMP);
   cl_assert_equal_i(s_injected.io.numcmp_accept, 1);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+// Ended pairings
+
+void test_nimble_pairing__answer_after_display_pairing_ended_is_ignored(void) {
+  prv_request(BLE_SM_IOACT_DISP, 0);
+  nimble_pairing_handle_completed();
+
+  // The link may be gone and its handle reused; a late reject must not drop another connection.
+  bt_driver_pairing_confirm(prv_ctx(), false);
+
+  cl_assert_equal_i(s_injected.count, 1);
+  cl_assert_equal_i(s_terminated.count, 0);
+}
+
+void test_nimble_pairing__answer_after_numcmp_pairing_ended_is_ignored(void) {
+  prv_request(BLE_SM_IOACT_NUMCMP, 123456);
+  nimble_pairing_handle_completed();
+
+  bt_driver_pairing_confirm(prv_ctx(), true);
+
+  cl_assert_equal_i(s_injected.count, 0);
+  cl_assert_equal_i(s_terminated.count, 0);
+}
+
+void test_nimble_pairing__numcmp_after_ended_display_pairing_uses_numcmp(void) {
+  prv_request(BLE_SM_IOACT_DISP, 0);
+  nimble_pairing_handle_completed();
+
+  prv_request(BLE_SM_IOACT_NUMCMP, 222222);
+  bt_driver_pairing_confirm(prv_ctx(), false);
+
+  cl_assert_equal_i(s_injected.count, 2);
+  cl_assert_equal_i(s_injected.io.action, BLE_SM_IOACT_NUMCMP);
+  cl_assert_equal_i(s_injected.io.numcmp_accept, 0);
+  cl_assert_equal_i(s_terminated.count, 0);
 }

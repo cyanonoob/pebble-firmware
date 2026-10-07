@@ -1,5 +1,6 @@
 /* SPDX-FileCopyrightText: 2025 Google LLC */
 /* SPDX-FileCopyrightText: 2026 Geert van Dijk */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "nimble_pairing.h"
@@ -50,8 +51,17 @@ uint32_t nimble_pairing_handle_passkey_action(uint16_t conn_handle,
   }
 }
 
+void nimble_pairing_handle_completed(void) {
+  s_pending_action = BLE_SM_IOACT_NONE;
+}
+
 void bt_driver_pairing_confirm(const PairingUserConfirmationCtx *ctx, bool is_confirmed) {
   uint16_t conn_handle = (uintptr_t)ctx;
+
+  if (s_pending_action == BLE_SM_IOACT_NONE) {
+    PBL_LOG(LOG_LEVEL_WARNING, "No pairing waiting for the user, ignoring answer");
+    return;
+  }
 
   if (s_pending_action == BLE_SM_IOACT_DISP) {
     // The passkey went to the stack when it was shown and the phone does the checking; the watch
