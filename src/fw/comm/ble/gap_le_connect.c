@@ -499,6 +499,11 @@ void bt_driver_handle_le_disconnection_complete_event(const BleDisconnectionComp
     case HciStatusCode_Success: {
       // Disconnection! Update our records:
       GAPLEConnection *connection = gap_le_connection_by_device(&event->peer_address);
+      if (!connection) {
+        // Stopping Bluetooth drops its links after the connections are gone.
+        PBL_LOG(LOG_LEVEL_DEBUG, "LE Disconn: no connection for hdl=%u", event->handle);
+        break;
+      }
 #if CAPABILITY_HAS_BUILTIN_HRM
       ble_hrm_handle_disconnection(connection);
 #endif
