@@ -1,7 +1,10 @@
 /* SPDX-FileCopyrightText: 2025 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include <bluetooth/gatt.h>
+#include <comm/ble/gap_le_connection.h>
+#include <comm/bt_lock.h>
 #include <host/ble_hs.h>
 #include <system/logging.h>
 #include <util/math.h>
@@ -16,6 +19,24 @@
 static bool s_discovery_in_progress;
 static bool s_stop_discovery_requested;
 static SemaphoreHandle_t s_discovery_stopped;
+
+//! Takes bt_lock if the connection still exists. Stopping Bluetooth frees the
+//! connections before the host fails the procedures still running on them.
+static bool prv_lock_connection(const GAPLEConnection *connection) {
+  bt_lock();
+  if (gap_le_connection_is_valid(connection)) {
+    return true;
+  }
+  bt_unlock();
+  return false;
+}
+
+static void prv_notify_complete(GAPLEConnection *connection, BTErrno err) {
+  if (prv_lock_connection(connection)) {
+    bt_driver_cb_gatt_client_discovery_complete(connection, err);
+    bt_unlock();
+  }
+}
 
 // -------------------------------------------------------------------------------------------------
 // Gatt Client Discovery API calls
@@ -189,8 +210,11 @@ static int prv_on_svc_chgd_subscribe(uint16_t conn_handle, const struct ble_gatt
               error->status);
   } else {
     GATTServiceDiscoveryDescriptorContext *ctx = arg;
-    bt_driver_cb_gatt_client_discovery_handle_service_changed(ctx->connection,
-                                                              ctx->chr_handle);
+    if (prv_lock_connection(ctx->connection)) {
+      bt_driver_cb_gatt_client_discovery_handle_service_changed(ctx->connection,
+                                                                ctx->chr_handle);
+      bt_unlock();
+    }
 
     PBL_LOG_D(LOG_DOMAIN_BT, LOG_LEVEL_DEBUG, "Subscribed to service changed");
   }
@@ -201,8 +225,13 @@ static int prv_on_svc_chgd_subscribe(uint16_t conn_handle, const struct ble_gatt
 }
 
 static void prv_convert_service_and_notify_os(uint16_t conn_handle, GATTServiceDiscoveryContext *context) {
+  if (!prv_lock_connection(context->connection)) {
+    prv_free_discovery_context(context);
+    return;
+  }
   list_foreach(context->services, prv_convert_service_and_notify_os_cb, context->connection);
   bt_driver_cb_gatt_client_discovery_complete(context->connection, BTErrnoOK);
+  bt_unlock();
 
   // Subscribe to service changed indications (BLE Core 6.0, part G 7.7.1)
   uint16_t chr_handle, dsc_handle;
@@ -385,7 +414,7 @@ static int prv_find_dsc_cb(uint16_t conn_handle, const struct ble_gatt_error *er
       }
 
       s_discovery_in_progress = false;
-      bt_driver_cb_gatt_client_discovery_complete(context->connection, errno);
+      prv_notify_complete(context->connection, errno);
       prv_free_discovery_context(context);
       break;
   }
@@ -458,7 +487,7 @@ static int prv_find_chr_cb(uint16_t conn_handle, const struct ble_gatt_error *er
       }
 
       s_discovery_in_progress = false;
-      bt_driver_cb_gatt_client_discovery_complete(context->connection, errno);
+      prv_notify_complete(context->connection, errno);
       prv_free_discovery_context(context);
       break;
   }
@@ -506,7 +535,7 @@ static int prv_find_inc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error
       } else {
         // no services found
         s_discovery_in_progress = false;
-        bt_driver_cb_gatt_client_discovery_complete(context->connection, BTErrnoOK);
+        prv_notify_complete(context->connection, BTErrnoOK);
         prv_free_discovery_context(context);
       }
 
@@ -523,7 +552,7 @@ static int prv_find_inc_svc_cb(uint16_t conn_handle, const struct ble_gatt_error
       }
 
       s_discovery_in_progress = false;
-      bt_driver_cb_gatt_client_discovery_complete(context->connection, errno);
+      prv_notify_complete(context->connection, errno);
       prv_free_discovery_context(context);
       break;
   }
