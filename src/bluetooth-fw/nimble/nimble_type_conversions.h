@@ -1,9 +1,11 @@
 /* SPDX-FileCopyrightText: 2025 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #pragma once
 
 #include <bluetooth/bluetooth_types.h>
+#include <bluetooth/hci_types.h>
 #include <bluetooth/responsiveness.h>
 #include <host/ble_gap.h>
 #include <nimble/ble.h>
@@ -25,5 +27,7 @@ void nimble_conn_params_to_pebble(struct ble_gap_conn_desc *desc, BleConnectionP
 
 void pebble_conn_update_to_nimble(const BleConnectionParamsUpdateReq *req,
                                   struct ble_gap_upd_params *params);
+
+HciStatusCode nimble_hs_status_to_hci(int status);
 
 void nimble_uuid_to_pebble(const ble_uuid_any_t *stack_uuid, Uuid *uuid);

@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2025 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include <bluetooth/responsiveness.h>
@@ -6,8 +7,8 @@
 
 #include "nimble_type_conversions.h"
 
-bool bt_driver_le_connection_parameter_update(const BTDeviceInternal *addr,
-                                              const BleConnectionParamsUpdateReq *req) {
+HciStatusCode bt_driver_le_connection_parameter_update(const BTDeviceInternal *addr,
+                                                       const BleConnectionParamsUpdateReq *req) {
   ble_addr_t nimble_addr;
   struct ble_gap_conn_desc desc;
   struct ble_gap_upd_params params;
@@ -18,7 +19,7 @@ bool bt_driver_le_connection_parameter_update(const BTDeviceInternal *addr,
   rc = ble_gap_conn_find_by_addr(&nimble_addr, &desc);
   if (rc != 0) {
     PBL_LOG(LOG_LEVEL_ERROR, "ble_gap_conn_find_by_addr failed: %d", rc);
-    return false;
+    return HciStatusCode_UnknownConnectionIdentifier;
   }
 
   pebble_conn_update_to_nimble(req, &params);
@@ -32,8 +33,7 @@ bool bt_driver_le_connection_parameter_update(const BTDeviceInternal *addr,
   rc = ble_gap_update_params(desc.conn_handle, &params);
   if (rc != 0) {
     PBL_LOG(LOG_LEVEL_ERROR, "ble_gap_update_params failed: 0x%04x", (uint16_t)rc);
-    return false;
   }
 
-  return true;
+  return nimble_hs_status_to_hci(rc);
 }

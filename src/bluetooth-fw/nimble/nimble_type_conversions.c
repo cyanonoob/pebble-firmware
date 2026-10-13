@@ -1,10 +1,13 @@
 /* SPDX-FileCopyrightText: 2025 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #include "nimble_type_conversions.h"
 
 #include <btutil/bt_uuid.h>
 #include <host/ble_gap.h>
+#include <host/ble_hs.h>
+#include <stdint.h>
 #include <string.h>
 
 void nimble_addr_to_pebble_addr(const ble_addr_t *addr, BTDeviceAddress *addr_out) {
@@ -44,6 +47,18 @@ void nimble_conn_params_to_pebble(struct ble_gap_conn_desc *desc, BleConnectionP
   params->conn_interval_1_25ms = desc->conn_itvl;
   params->slave_latency_events = desc->conn_latency;
   params->supervision_timeout_10ms = desc->supervision_timeout;
+}
+
+HciStatusCode nimble_hs_status_to_hci(int status) {
+  if (status == 0) {
+    return HciStatusCode_Success;
+  }
+
+  if ((status > BLE_HS_ERR_HCI_BASE) && (status <= BLE_HS_ERR_HCI_BASE + UINT8_MAX)) {
+    return (HciStatusCode)(status - BLE_HS_ERR_HCI_BASE);
+  }
+
+  return HciStatusCode_UnspecifiedError;
 }
 
 void pebble_conn_update_to_nimble(const BleConnectionParamsUpdateReq *req,

@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2024 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #pragma once
@@ -123,6 +124,7 @@ typedef struct GAPLEConnection {
   struct {
     TimerID watchdog_timer;
     uint8_t attempts;
+    uint8_t collisions;
     bool is_request_pending;
   } param_update_info;
 

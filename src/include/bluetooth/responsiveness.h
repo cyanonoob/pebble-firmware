@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2024 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #pragma once
@@ -9,6 +10,7 @@
 #include <bluetooth/bluetooth_types.h>
 
 #include "bluetooth/gap_le_connect.h"
+#include "bluetooth/hci_types.h"
 #include "util/attributes.h"
 
 typedef enum {
@@ -66,5 +68,6 @@ typedef struct PACKED { // PACKED since this struct is serialized
   uint16_t supervision_timeout_10ms;
 } BleConnectionParamsUpdateReq;
 
-bool bt_driver_le_connection_parameter_update(
+//! @return HciStatusCode_Success if the request was sent, otherwise the reason it was not.
+HciStatusCode bt_driver_le_connection_parameter_update(
     const BTDeviceInternal *addr, const BleConnectionParamsUpdateReq *req);

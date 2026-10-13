@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2024 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Core Devices LLC */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 #define FILE_LOG_COLOR LOG_COLOR_BLUE
@@ -71,6 +72,10 @@
 //! Try 3 times before giving up.
 #define MAX_UPDATE_REQUEST_ATTEMPTS (3)
 
+//! Collisions with a peer procedure don't count as attempts, up to this many.
+#define MAX_COLLISION_RETRIES (10)
+#define COLLISION_RETRY_MS    (2 * 1000)
+
 // TODO: Check slave_latency_events values. We currently observe some connection
 // drops that *may* be related to the slave latency being "too high". Let's just
 // remove slave latency for now, and see if that helps.
@@ -99,6 +104,7 @@ extern void conn_mgr_handle_desired_state_granted(GAPLEConnection *hdl,
                                                   ResponseTimeState granted_state);
 
 static void prv_watchdog_timer_callback(void *ctx);
+static bool prv_handle_update_failed(GAPLEConnection *connection, HciStatusCode status);
 
 static const GAPLEConnectRequestParams *prv_params_for_state(const GAPLEConnection *connection,
                                                              ResponseTimeState state) {
@@ -176,9 +182,12 @@ static void prv_request_params_update(GAPLEConnection *connection,
     .supervision_timeout_10ms = desired_params->supervision_timeout_10ms,
   };
 
-  const bool success = bt_driver_le_connection_parameter_update(&connection->device, &req);
-  if (success) {
+  const HciStatusCode status =
+      bt_driver_le_connection_parameter_update(&connection->device, &req);
+  if (status == HciStatusCode_Success) {
     connection->param_update_info.is_request_pending = true;
+  } else if (prv_handle_update_failed(connection, status)) {
+    return;
   }
 
 retry:
@@ -208,6 +217,7 @@ void gap_le_connect_params_request(GAPLEConnection *connection,
                                    ResponseTimeState desired_state) {
   // A new desired state is requested by the FW, start afresh:
   connection->param_update_info.attempts = 0;
+  connection->param_update_info.collisions = 0;
 
   prv_request_params_update(connection, desired_state);
 }
@@ -257,6 +267,28 @@ void gap_le_connect_params_re_evaluate(GAPLEConnection *connection) {
   prv_evaluate(connection, desired_state);
 }
 
+//! Returns true if a retry was scheduled.
+static bool prv_handle_update_failed(GAPLEConnection *connection, HciStatusCode status) {
+  connection->param_update_info.is_request_pending = false;
+
+  if (((status != HciStatusCode_LLProcedureCollision) &&
+       (status != HciStatusCode_DifferentTransactionCollision)) ||
+      (connection->param_update_info.collisions >= MAX_COLLISION_RETRIES)) {
+    return false;
+  }
+
+  connection->param_update_info.collisions++;
+  if (connection->param_update_info.attempts > 0) {
+    connection->param_update_info.attempts--;
+  }
+
+  PBL_LOG(LOG_LEVEL_DEBUG, "Conn param request collided (0x%02x), retrying", status);
+  new_timer_start(connection->param_update_info.watchdog_timer, COLLISION_RETRY_MS,
+                  prv_watchdog_timer_callback, connection, 0);
+
+  return true;
+}
+
 // -------------------------------------------------------------------------------------------------
 //! Extern'd for and used by gap_le_connect.c
 //! Handles Bluetopia's Connection Parameter Updated event.
@@ -266,13 +298,14 @@ void gap_le_connect_params_re_evaluate(GAPLEConnection *connection) {
 void bt_driver_handle_le_conn_params_update_event(const BleConnectionUpdateCompleteEvent *event) {
   bt_lock();
   const BleConnectionParams *params = &event->conn_params;
-  if (event->status != HciStatusCode_Success) {
-    goto unlock;
-  }
-
   GAPLEConnection *connection = gap_le_connection_by_addr(&event->dev_address);
   if (!connection) {
     PBL_LOG(LOG_LEVEL_DEBUG, "Receiving conn param update but connection is no longer open");
+    goto unlock;
+  }
+
+  if (event->status != HciStatusCode_Success) {
+    prv_handle_update_failed(connection, event->status);
     goto unlock;
   }
 
