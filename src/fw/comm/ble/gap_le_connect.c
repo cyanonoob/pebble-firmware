@@ -403,7 +403,6 @@ void bt_driver_handle_le_connection_complete_event(const BleConnectionCompleteEv
         PBL_LOG(LOG_LEVEL_ERROR,
                 "Not adding connection for device. It is already connected .. disconnecting");
         bt_driver_gap_le_disconnect(&event->peer_address);
-        param_watchdog_timer = TIMER_INVALID_ID; // Don't use timer, will clean up below
         break;
       }
 
