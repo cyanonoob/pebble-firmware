@@ -1,0 +1,11 @@
+/* SPDX-FileCopyrightText: 2026 Geert van Dijk */
+/* SPDX-License-Identifier: Apache-2.0 */
+
+#pragma once
+
+#define MYNEWT_VAL(x) MYNEWT_VAL_##x
+
+#define MYNEWT_VAL_BLE_TRANSPORT_EVT_SIZE (70)
+#define MYNEWT_VAL_BLE_TRANSPORT_ACL_FROM_LL_COUNT (20)
+#define MYNEWT_VAL_BLE_TRANSPORT_EVT_COUNT (4)
+#define MYNEWT_VAL_BLE_TRANSPORT_EVT_DISCARDABLE_COUNT (16)

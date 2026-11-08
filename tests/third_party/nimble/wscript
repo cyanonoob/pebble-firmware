@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 Geert van Dijk
+# SPDX-License-Identifier: Apache-2.0
+
+from waftools.pebble_test import clar
+
+
+def build(ctx):
+    clar(ctx,
+         sources_ant_glob=(
+             "third_party/nimble/mynewt-nimble/nimble/transport/common/hci_h4/src/hci_h4.c"),
+         test_sources_ant_glob="test_hci_uart_transport.c",
+         override_includes=['hci_uart_transport'],
+         add_includes=[
+             "third_party/nimble",
+             "third_party/nimble/mynewt-nimble/nimble/transport/common/hci_h4/include",
+         ])
