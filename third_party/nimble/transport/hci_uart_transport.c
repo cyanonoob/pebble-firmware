@@ -76,9 +76,6 @@ static void prv_uart_init() {
 
 #define EHCILL_DBG(x, ...) PBL_LOG_D(LOG_DOMAIN_BT_STACK, LOG_LEVEL_ERROR, "eHCILL: " x, ##__VA_ARGS__)
 
-// this should be fixed with the eHCILL SP update
-// #define EHCILL_RETRANSMISSIONS_LEGAL
-
 typedef enum EhcillSleepSmState {
   
   // AWAKE: We can transmit packets freely.
@@ -288,102 +285,101 @@ static void prv_lock(void) { portENTER_CRITICAL(); }
 static void prv_unlock(void) { portEXIT_CRITICAL(); }
 
 
+// First byte of an H4 packet that the controller may legitimately send us.
+static bool prv_is_controller_h4_type(uint8_t byte) {
+  return (byte == HCI_H4_ACL) || (byte == HCI_H4_EVT) || (byte == HCI_H4_ISO);
+}
+
+// Called by the H4 parser at every packet boundary. Consumes eHCILL bytes, and instead of
+// crashing, drops whatever cannot start a packet in the current state: a byte garbled while the
+// UART came back up, or a stale request from a wake-up collision (SWRA288B 2.6.3, 2.6.4). A
+// non-eHCILL byte that is not a valid H4 packet type must never reach the H4 parser, which
+// asserts on it.
 static uint16_t hci_uart_packet_cb(const uint8_t *buf, uint16_t len) {
   assert(len > 0);
+  const uint8_t byte = buf[0];
+  const char *anomaly = NULL;
+  uint16_t consumed = 1;
+
   mutex_lock(s_ehcill_mutex);
   prv_lock(); // make sure that eHCILL state machine transitions are atomic with respect to ISR also
-  switch (s_ehcill_sm) {
+  const EhcillSleepSmState state = s_ehcill_sm;
+  switch (state) {
   case EHCILL_AWAKE:
   case EHCILL_SEND_ACK_THEN_AWAKE:
-    if (buf[0] == CMD_HCILL_GO_TO_SLEEP_IND) {
+    if (byte == CMD_HCILL_GO_TO_SLEEP_IND) {
       prv_ehcill_state(EHCILL_PENDING_XMIT_SLEEP);
       uart_set_tx_interrupt_enabled(BLUETOOTH_UART, true);
-      prv_unlock();
-      mutex_unlock(s_ehcill_mutex);
-      EHCILL_DBG("recv CMD_HCILL_GO_TO_SLEEP_IND");
-      return 1 /* we consumed the byte */;
+    } else if (byte == CMD_HCILL_WAKE_UP_IND) {
+      // The controller did not see our WAKE_UP_ACK; ack again (SWRA288B 2.3). The TX path holds
+      // the ack back until the packet being sent, if any, is complete.
+      anomaly = "WAKE_UP_IND while awake, acking again";
+      prv_ehcill_state(EHCILL_SEND_ACK_THEN_AWAKE);
+      uart_set_tx_interrupt_enabled(BLUETOOTH_UART, true);
+    } else if (byte == CMD_HCILL_WAKE_UP_ACK) {
+      anomaly = "ignoring WAKE_UP_ACK while awake";
+    } else if (prv_is_controller_h4_type(byte)) {
+      consumed = 0; // a real H4 packet; let the parser do its job
+    } else {
+      anomaly = "dropping byte that cannot start an H4 packet";
     }
-    if (buf[0] == CMD_HCILL_WAKE_UP_IND) {
-#ifdef EHCILL_RETRANSMISSIONS_LEGAL
-      /* This can also happen if waking the UART up sends a glitch, which
-       * causes the next byte to be garbled.  We can't just send another
-       * ACK, though, because if we were slow on the draw to wake up, maybe
-       * we will be stomping on a packet?  I guess we eat it for now and
-       * just cry
-       */
-      EHCILL_DBG("recv CMD_HCILL_WAKE_UP_IND out of sequence, maybe we were slow on the draw to wake up?");
-      return 1;
-#else
-      PBL_CROAK("CMD_HCILL_WAKE_UP_IND while already awake!");
-      WTF;
-#endif
-    }
-   if (buf[0] == CMD_HCILL_WAKE_UP_ACK) {
-      PBL_CROAK("CMD_HCILL_WAKE_UP_ACK while already awake!");
-      WTF;
-    }
-    prv_unlock();
-    mutex_unlock(s_ehcill_mutex);
-    return 0; /* otherwise, this has to be a H4 packet; let the parser do its job */
-  
+    break;
+
   case EHCILL_PENDING_XMIT_SLEEP:
   case EHCILL_PENDING_XMIT_SLEEP_FLUSH:
   case EHCILL_PENDING_SHUTDOWN_UART_BH:
-    if (buf[0] == CMD_HCILL_GO_TO_SLEEP_IND) {
-      /* Ok, we were just slow answering. */
-      prv_unlock();
-      mutex_unlock(s_ehcill_mutex);
-
+    if (byte == CMD_HCILL_GO_TO_SLEEP_IND) {
       EHCILL_DBG("baseband is grumpy that we were slow going to sleep");
-      return 1;
+    } else if (byte == CMD_HCILL_WAKE_UP_IND) {
+      // The controller wants to talk before we finished going to sleep: take RTS/CTS back from the
+      // wakeup logic and ack.
+      exti_disable(BOARD_CONFIG_BT_COMMON.wakeup.int_exti);
+      uart_enable_flow_control(BLUETOOTH_UART);
+      prv_ehcill_state(EHCILL_SEND_ACK_THEN_AWAKE);
+      uart_set_tx_interrupt_enabled(BLUETOOTH_UART, true);
+    } else {
+      anomaly = "dropping byte received while going to sleep";
     }
-    PBL_CROAK("packet from baseband while pending entering sleep!");
-    return 0;
-  
+    break;
+
   case EHCILL_ASLEEP:
   case EHCILL_WAKE_UP_UART_BH:
   case EHCILL_SEND_WAKE_UP_IND:
   case EHCILL_WAIT_FOR_WAKE_IND:
-    if (buf[0] == CMD_HCILL_WAKE_UP_IND) {
+    if (byte == CMD_HCILL_WAKE_UP_IND) {
       prv_ehcill_state(EHCILL_SEND_ACK_THEN_AWAKE);
       uart_set_tx_interrupt_enabled(BLUETOOTH_UART, true); // if there's work to do, we can continue again
-      prv_unlock();
-      EHCILL_DBG("recv CMD_HCILL_WAKE_UP_IND");
-      mutex_unlock(s_ehcill_mutex);
-      return 1 /* we consumed it */;
+    } else if (byte == CMD_HCILL_GO_TO_SLEEP_IND) {
+      // A sleep request that was still queued in the controller (SWRA288B 2.6.4).
+      EHCILL_DBG("ignoring stale GO_TO_SLEEP_IND");
+    } else {
+      anomaly = "dropping byte received while asleep";
     }
-#ifdef EHCILL_RETRANSMISSIONS_LEGAL
-    if (buf[0] == CMD_HCILL_GO_TO_SLEEP_IND) {
-      prv_unlock();
-      EHCILL_DBG("recv CMD_HCILL_GO_TO_SLEEP_IND while already asleep.  wow, we must have been slow");
-      mutex_unlock(s_ehcill_mutex);
-      return 1 /* we consumed it */;
-    }
-#endif
-    PBL_CROAK("illegal HCI command received while nominally asleep");
-    WTF;
     break;
-  
+
   case EHCILL_WAIT_FOR_WAKE_ACK:
-    if (buf[0] == CMD_HCILL_WAKE_UP_IND || buf[0] == CMD_HCILL_WAKE_UP_ACK) {
+    if (byte == CMD_HCILL_WAKE_UP_IND || byte == CMD_HCILL_WAKE_UP_ACK) {
+      // A WAKE_UP_IND here is a wake-up collision and counts as the ack (SWRA288B 2.6.3).
       prv_ehcill_state(EHCILL_AWAKE);
       uart_set_tx_interrupt_enabled(BLUETOOTH_UART, true); // if there's work to do, we can continue again
-      prv_unlock();
-      if (buf[0] == CMD_HCILL_WAKE_UP_IND) {
-        EHCILL_DBG("recv CMD_HCILL_WAKE_UP_IND");
-      } else {
-        EHCILL_DBG("recv CMD_HCILL_WAKE_UP_ACK");
-      }
-      mutex_unlock(s_ehcill_mutex);
-      return 1 /* we consumed it */;
+    } else if (byte == CMD_HCILL_GO_TO_SLEEP_IND) {
+      // Wake-up collision type 2: the queued sleep request must be ignored (SWRA288B 2.6.4).
+      EHCILL_DBG("ignoring GO_TO_SLEEP_IND that crossed our WAKE_UP_IND");
+    } else {
+      anomaly = "dropping byte received while waiting for WAKE_UP_ACK";
     }
-    PBL_CROAK("illegal HCI command received while waiting for wake ack");
-    WTF;
     break;
-  
+
   default:
     WTF;
   }
+  prv_unlock();
+  mutex_unlock(s_ehcill_mutex);
+
+  if (anomaly) {
+    PBL_LOG(LOG_LEVEL_WARNING, "eHCILL: %s (byte 0x%x, state %d)", anomaly, byte, (int)state);
+  }
+  return consumed;
 }
 
 static int hci_uart_frame_cb(uint8_t pkt_type, void *data) {
@@ -429,12 +425,19 @@ static int hci_uart_tx_char(BaseType_t *should_context_switch) {
   uint8_t ch;
   bool should_dispose = false;
 
-  if (s_ehcill_sm == EHCILL_SEND_ACK_THEN_AWAKE) {
+  // Peeking has no side effects. We need to know whether a packet is half sent before deciding
+  // whether an eHCILL byte may go out now: one in the middle of a packet would corrupt it.
+  if (xQueuePeekFromISR(s_tx_queue, &tx) == pdFALSE) {
+    tx = NULL;
+  }
+  const bool mid_packet = tx && tx->sent_type;
+
+  if (s_ehcill_sm == EHCILL_SEND_ACK_THEN_AWAKE && !mid_packet) {
     EHCILL_DBG("waiting to send ack, xmit CMD_HCILL_WAKE_UP_ACK");
     prv_ehcill_state(EHCILL_AWAKE);
     return CMD_HCILL_WAKE_UP_ACK;
   }
-  
+
   if (s_ehcill_sm == EHCILL_PENDING_XMIT_SLEEP_FLUSH) {
     EHCILL_DBG("last tx is done");
     prv_ehcill_state(EHCILL_PENDING_SHUTDOWN_UART_BH);
@@ -442,8 +445,7 @@ static int hci_uart_tx_char(BaseType_t *should_context_switch) {
     return -1;
   }
 
-  if ((xQueuePeekFromISR(s_tx_queue, &tx) == pdFALSE) &&
-      (s_ehcill_sm != EHCILL_PENDING_XMIT_SLEEP)) {
+  if (!tx && (s_ehcill_sm != EHCILL_PENDING_XMIT_SLEEP)) {
     return -1;
   }
 
