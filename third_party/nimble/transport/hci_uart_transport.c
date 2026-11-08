@@ -18,10 +18,14 @@
 #include <os/os_mempool.h>
 #include <queue.h>
 #include <services/common/system_task.h>
+#include <system/logging.h>
 #include <system/passert.h>
+#include <task.h>
 #include <util/circular_buffer.h>
 #include <util/math.h>
 #include <kernel/util/stop.h>
+
+#include <inttypes.h>
 
 // XXX: HACK: we need this to get access to rts_gpio and cts_gpio
 #include "drivers/stm32f2/uart_definitions.h"
@@ -195,6 +199,22 @@ static bool chipset_start_done = false;
 
 static struct uart_tx *uart_tx_dispose_head = NULL;
 
+// If the controller does not finish a wake-up handshake within this time, we (re)send
+// WAKE_UP_IND ourselves. cc2564.c disables the controller's own WAKE_UP_IND retransmission, so
+// without this a single lost byte leaves both sides waiting for each other forever.
+#define EHCILL_WAKE_TIMEOUT_MS 250
+// Reset (assert) after this many unanswered wake-ups in a row, about 5 s.
+#define EHCILL_WAKE_MAX_RETRIES 20
+
+// Tick at which we last started waiting for the controller's half of a wake-up handshake.
+static TickType_t s_ehcill_wait_start;
+// Consecutive wake-ups the controller did not answer in time; reset once we are awake.
+static uint32_t s_ehcill_wake_retries;
+
+static bool prv_ehcill_waiting_for_peer(EhcillSleepSmState st) {
+  return (st == EHCILL_WAIT_FOR_WAKE_ACK) || (st == EHCILL_WAIT_FOR_WAKE_IND);
+}
+
 static void prv_ehcill_state(EhcillSleepSmState st) {
   switch(st) {
 #define ST(x) case x: /*EHCILL_DBG("SM transition " #x);*/ break;
@@ -210,6 +230,11 @@ static void prv_ehcill_state(EhcillSleepSmState st) {
   ST(EHCILL_WAIT_FOR_WAKE_IND)
 #undef ST
   default: WTF;
+  }
+  if (prv_ehcill_waiting_for_peer(st)) {
+    s_ehcill_wait_start = xTaskGetTickCountFromISR();
+  } else if (st == EHCILL_AWAKE) {
+    s_ehcill_wake_retries = 0;
   }
   s_ehcill_sm = st;
 }
@@ -445,7 +470,10 @@ static int hci_uart_tx_char(BaseType_t *should_context_switch) {
     return -1;
   }
 
-  if (!tx && (s_ehcill_sm != EHCILL_PENDING_XMIT_SLEEP)) {
+  // Nothing to send, unless we owe the controller a sleep ack or a wake-up (the latter also
+  // without data of our own, when a controller-initiated wake-up stalled).
+  if (!tx && (s_ehcill_sm != EHCILL_PENDING_XMIT_SLEEP) &&
+      (s_ehcill_sm != EHCILL_SEND_WAKE_UP_IND)) {
     return -1;
   }
 
@@ -558,74 +586,123 @@ static bool prv_uart_rx_irq_handler(UARTDevice *dev, uint8_t data,
   return should_context_switch;
 }
 
+// Called from the RX task: if a wake-up handshake has stalled, start it again from our side by
+// sending WAKE_UP_IND. The controller answers that with WAKE_UP_ACK, or with WAKE_UP_IND if it is
+// waking up too (collision type 1, SWRA288B 2.6.3); both complete the wake-up.
+static void prv_ehcill_check_wake_timeout(void) {
+  bool retransmit = false;
+  uint32_t retries = 0;
+
+  mutex_lock(s_ehcill_mutex);
+  prv_lock();
+  const EhcillSleepSmState state = s_ehcill_sm;
+  if (prv_ehcill_waiting_for_peer(state) &&
+      (xTaskGetTickCount() - s_ehcill_wait_start) >= pdMS_TO_TICKS(EHCILL_WAKE_TIMEOUT_MS)) {
+    retries = ++s_ehcill_wake_retries;
+    retransmit = true;
+    prv_ehcill_state(EHCILL_SEND_WAKE_UP_IND);
+    uart_set_tx_interrupt_enabled(BLUETOOTH_UART, true);
+  }
+  prv_unlock();
+  mutex_unlock(s_ehcill_mutex);
+
+  if (retransmit) {
+    PBL_LOG(LOG_LEVEL_WARNING, "eHCILL: wake-up not answered (state %d), resending WAKE_UP_IND, "
+            "try %"PRIu32, (int)state, retries);
+    PBL_ASSERT(retries <= EHCILL_WAKE_MAX_RETRIES, "eHCILL: controller stopped answering wake-ups");
+  }
+}
+
+// How long the RX task may block before the wake-up handshake needs checking again.
+static TickType_t prv_rx_wait_ticks(void) {
+  prv_lock();
+  const bool waiting = prv_ehcill_waiting_for_peer(s_ehcill_sm);
+  const TickType_t elapsed = xTaskGetTickCount() - s_ehcill_wait_start;
+  prv_unlock();
+
+  if (!waiting) {
+    return portMAX_DELAY;
+  }
+  const TickType_t timeout = pdMS_TO_TICKS(EHCILL_WAKE_TIMEOUT_MS);
+  return (elapsed >= timeout) ? 0 : (timeout - elapsed);
+}
+
 static uint8_t read_buf[64];
-static void prv_rx_task_main(void *unused) {
+
+// One pass of the RX task: wake-up timeouts, the eHCILL bottom halves, disposal of transmitted
+// buffers, and parsing whatever the UART ISR has buffered.
+static void prv_rx_task_process(void) {
   int consumed_bytes;
   uint16_t bytes_remaining;
   struct uart_tx *dispose_head;
 
-  while (true) {
-    xSemaphoreTake(s_rx_data_ready, portMAX_DELAY);
+  prv_ehcill_check_wake_timeout();
 
-    mutex_lock(s_ehcill_mutex);
-    prv_lock();
-    if (s_ehcill_sm == EHCILL_PENDING_SHUTDOWN_UART_BH) {
-      prv_ehcill_state(EHCILL_ASLEEP);
-  
-      prv_unlock();
-  
-      EHCILL_DBG("bottom half shutting down UART, goodbye!");
-      prv_uart_go_to_sleep();
-    } else if (s_ehcill_sm == EHCILL_WAKE_UP_UART_BH) {
-      prv_ehcill_state(EHCILL_WAIT_FOR_WAKE_IND);
-      prv_unlock();
-      
-      EHCILL_DBG("bottom half waking up UART");      
-      prv_uart_init();
-    } else {
-      prv_unlock();
-    }
-    mutex_unlock(s_ehcill_mutex);
+  mutex_lock(s_ehcill_mutex);
+  prv_lock();
+  if (s_ehcill_sm == EHCILL_PENDING_SHUTDOWN_UART_BH) {
+    prv_ehcill_state(EHCILL_ASLEEP);
 
-    /* Dispose of any UART transmissions that the ISR has taken care of for
-     * us.  We can't do that in the ISR, because the ISR might need to take
-     * locks to hand things back to NimBLE!  Atomically grab the list of
-     * things to dispose, and then dispose of them.
-     */
-    prv_lock();
-    dispose_head = uart_tx_dispose_head;
-    uart_tx_dispose_head = NULL;
     prv_unlock();
 
-    prv_dispose_uart_tx(dispose_head);
+    EHCILL_DBG("bottom half shutting down UART, goodbye!");
+    prv_uart_go_to_sleep();
+  } else if (s_ehcill_sm == EHCILL_WAKE_UP_UART_BH) {
+    prv_ehcill_state(EHCILL_WAIT_FOR_WAKE_IND);
+    prv_unlock();
 
-    while (true) {
-      prv_lock();
+    EHCILL_DBG("bottom half waking up UART");
+    prv_uart_init();
+  } else {
+    prv_unlock();
+  }
+  mutex_unlock(s_ehcill_mutex);
 
-      bytes_remaining = circular_buffer_get_read_space_remaining(&s_rx_buffer);
-      if (bytes_remaining == 0) {
-        prv_unlock();
-        break;
-      }
+  /* Dispose of any UART transmissions that the ISR has taken care of for
+   * us.  We can't do that in the ISR, because the ISR might need to take
+   * locks to hand things back to NimBLE!  Atomically grab the list of
+   * things to dispose, and then dispose of them.
+   */
+  prv_lock();
+  dispose_head = uart_tx_dispose_head;
+  uart_tx_dispose_head = NULL;
+  prv_unlock();
 
-      bytes_remaining = MIN(sizeof(read_buf), bytes_remaining);
-      circular_buffer_copy(&s_rx_buffer, read_buf, bytes_remaining);
+  prv_dispose_uart_tx(dispose_head);
+
+  while (true) {
+    prv_lock();
+
+    bytes_remaining = circular_buffer_get_read_space_remaining(&s_rx_buffer);
+    if (bytes_remaining == 0) {
       prv_unlock();
-
-      consumed_bytes = hci_h4_sm_rx(&hci_uart_h4sm, read_buf, bytes_remaining);
-      if (consumed_bytes <= 0) {
-        PBL_LOG_D(LOG_DOMAIN_BT_STACK, LOG_LEVEL_ERROR, "hci_h4_sm_rx rc=%d", consumed_bytes);
-        break;
-      }
-
-      prv_lock();
-      bool ok = circular_buffer_consume(&s_rx_buffer, consumed_bytes);
-      PBL_ASSERTN(ok);
-      if (s_ehcill_sm != EHCILL_ASLEEP && s_ehcill_sm != EHCILL_WAKE_UP_UART_BH) {
-        uart_set_rx_interrupt_enabled(BLUETOOTH_UART, true);
-      }
-      prv_unlock();
+      break;
     }
+
+    bytes_remaining = MIN(sizeof(read_buf), bytes_remaining);
+    circular_buffer_copy(&s_rx_buffer, read_buf, bytes_remaining);
+    prv_unlock();
+
+    consumed_bytes = hci_h4_sm_rx(&hci_uart_h4sm, read_buf, bytes_remaining);
+    if (consumed_bytes <= 0) {
+      PBL_LOG_D(LOG_DOMAIN_BT_STACK, LOG_LEVEL_ERROR, "hci_h4_sm_rx rc=%d", consumed_bytes);
+      break;
+    }
+
+    prv_lock();
+    bool ok = circular_buffer_consume(&s_rx_buffer, consumed_bytes);
+    PBL_ASSERTN(ok);
+    if (s_ehcill_sm != EHCILL_ASLEEP && s_ehcill_sm != EHCILL_WAKE_UP_UART_BH) {
+      uart_set_rx_interrupt_enabled(BLUETOOTH_UART, true);
+    }
+    prv_unlock();
+  }
+}
+
+static void prv_rx_task_main(void *unused) {
+  while (true) {
+    xSemaphoreTake(s_rx_data_ready, prv_rx_wait_ticks());
+    prv_rx_task_process();
   }
 }
 
