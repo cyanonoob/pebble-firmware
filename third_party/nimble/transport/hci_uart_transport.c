@@ -1,4 +1,5 @@
 /* SPDX-FileCopyrightText: 2025 Google LLC */
+/* SPDX-FileCopyrightText: 2026 Geert van Dijk */
 /* SPDX-License-Identifier: Apache-2.0 */
 
 // TODO: transport.h needs os_mbuf.h to be included first
@@ -37,18 +38,30 @@ static void prv_rtscts_trigger(bool *should_context_switch);
 
 static uint32_t s_uart_baud = 115200; /* boot the system at 115200 */
 
+// Whether the Bluetooth UART is powered up. Only touched with s_ehcill_mutex held (or during
+// init), so that the UART is brought up and torn down exactly once per wake/sleep cycle and the
+// InhibitorBluetooth stop-mode count stays balanced.
+static bool s_uart_on;
+
 static bool prv_uart_tx_irq_handler(UARTDevice *dev);
 static bool prv_uart_rx_irq_handler(UARTDevice *dev, uint8_t data, const UARTRXErrorFlags *err_flags);
 
 static void prv_uart_init() {
+  if (s_uart_on) {
+    return;
+  }
+  s_uart_on = true;
+
+  // We are awake now; CTS goes back to being flow control, not a wakeup source.
+  exti_disable(BOARD_CONFIG_BT_COMMON.wakeup.int_exti);
   stop_mode_disable(InhibitorBluetooth);
-  
+
   uart_init(BLUETOOTH_UART);
   uart_set_baud_rate(BLUETOOTH_UART, s_uart_baud);
   uart_set_rx_interrupt_handler(BLUETOOTH_UART, prv_uart_rx_irq_handler);
   uart_set_tx_interrupt_handler(BLUETOOTH_UART, prv_uart_tx_irq_handler);
   uart_set_rx_interrupt_enabled(BLUETOOTH_UART, true);
-  
+
   uart_enable_flow_control(BLUETOOTH_UART);
 }
 
@@ -228,6 +241,11 @@ static void prv_uart_prepare_for_sleep() {
 
 static void prv_uart_go_to_sleep() {
   /* must not be called in ISR context! */
+  if (!s_uart_on) {
+    return;
+  }
+  s_uart_on = false;
+
   uart_set_rx_interrupt_enabled(BLUETOOTH_UART, false);
   uart_set_tx_interrupt_enabled(BLUETOOTH_UART, false);
 
@@ -656,14 +674,31 @@ void ble_update_baudrate(uint32_t baud) {
 static void ble_transport_tx_item(struct uart_tx *tx_item) {
   xQueueSendToBack(s_tx_queue, &tx_item, portMAX_DELAY);
   mutex_lock(s_ehcill_mutex);
-  if (s_ehcill_sm == EHCILL_PENDING_XMIT_SLEEP_FLUSH || s_ehcill_sm == EHCILL_PENDING_SHUTDOWN_UART_BH) {
-    EHCILL_DBG("enqueuing item to tx while asleep, but UART hasn't been shut down yet; just turning on flow control");
-    uart_enable_flow_control(BLUETOOTH_UART);
-    prv_ehcill_state(EHCILL_SEND_WAKE_UP_IND);
-  } else if (s_ehcill_sm == EHCILL_ASLEEP || s_ehcill_sm == EHCILL_WAKE_UP_UART_BH) {
+  // The UART ISRs and the CTS wakeup ISR move the state machine too, so decide and transition
+  // atomically with respect to them; only the (slow, non-ISR-safe) UART power-up happens outside.
+  bool power_up_uart = false;
+  prv_lock();
+  switch (s_ehcill_sm) {
+    case EHCILL_PENDING_XMIT_SLEEP_FLUSH:
+    case EHCILL_PENDING_SHUTDOWN_UART_BH:
+      // We already acked the controller's sleep request but the UART is still up: take RTS/CTS
+      // back from the wakeup logic and wake the controller again.
+      exti_disable(BOARD_CONFIG_BT_COMMON.wakeup.int_exti);
+      uart_enable_flow_control(BLUETOOTH_UART);
+      prv_ehcill_state(EHCILL_SEND_WAKE_UP_IND);
+      break;
+    case EHCILL_ASLEEP:
+    case EHCILL_WAKE_UP_UART_BH:
+      prv_ehcill_state(EHCILL_SEND_WAKE_UP_IND);
+      power_up_uart = true;
+      break;
+    default:
+      break;
+  }
+  prv_unlock();
+  if (power_up_uart) {
     EHCILL_DBG("enqueuing item to tx while asleep, triggering wakeup");
     prv_uart_init();
-    prv_ehcill_state(EHCILL_SEND_WAKE_UP_IND);
   }
   mutex_unlock(s_ehcill_mutex);
   uart_set_tx_interrupt_enabled(BLUETOOTH_UART, true);
